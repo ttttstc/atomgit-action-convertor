@@ -1,15 +1,15 @@
-# GitHub Actions → CodeArts Actions Converter
+# GitHub Actions → AtomGit Actions Converter
 
 [中文](README.md)
 
-A tool for converting GitHub Actions source repositories into CodeArts Actions (AtomGit) plugin repositories.
+A tool for converting GitHub Actions source repositories into AtomGit Actions plugin repositories.
 
 ## Features
 
 - **Environment Variable Conversion** — `GITHUB_*` → `ATOMGIT_*`
 - **Context Expression Conversion** — `${{ github.* }}` → `${{ atomgit.* }}` (inside `${{ }}` blocks only)
-- **Dependency Conversion** — `@actions/*` → `@atomgit/*`
 - **Compatibility Scanning** — Auto-detects patterns that cannot be auto-converted (Octokit calls, GitHub API, etc.)
+- **Pre-conversion Evaluation** — Output feasibility report before executing conversion
 
 ## Supported Action Types
 
@@ -24,23 +24,18 @@ A tool for converting GitHub Actions source repositories into CodeArts Actions (
 | Rating | Meaning |
 |--------|---------|
 | 🟢 GREEN | Fully auto-convertible, no GitHub API dependencies |
-| 🟡 YELLOW | Contains `@actions/github` — converted, requires manual adaptation |
-| 🔴 RED | Contains Octokit/GitHub API calls — converted, requires human review |
+| 🟡 YELLOW | Contains @actions/* dependencies, requires manual adaptation |
+| 🔴 RED | Contains Octokit/GitHub API calls, requires reimplementation |
 
 ## Quick Start
-
-### Install Dependencies
-
-No external dependencies required. Run directly:
-
-```bash
-python convert.py --help
-```
 
 ### Basic Usage
 
 ```bash
-# Convert a repository
+# Pre-conversion evaluation (recommended)
+python convert.py --input <source-repo> --evaluate-only
+
+# Execute conversion
 python convert.py --input <source-repo> --output <output-repo>
 
 # Dry-run (analyze only, no file changes)
@@ -50,23 +45,22 @@ python convert.py --input <source-repo> --output <output-repo> --dry-run
 ### Full Conversion Workflow
 
 ```bash
-# 1. Convert
+# 1. Pre-conversion evaluation
+python convert.py --input ./my-action --evaluate-only
+
+# 2. Execute conversion
 python convert.py --input ./my-action --output ./my-action-atomgit
 
-# 2. Install dependencies
+# 3. Handle @actions/* dependencies (manual)
+# Replace with AtomGit platform equivalents
+
+# 4. Rebuild (required)
 cd my-action-atomgit
 npm install
-
-# 3. Build
 npm run build
-# or
-npx @vercel/ncc build src/index.ts -o dist
 
-# 4. Test
+# 5. Test
 npm test
-
-# 5. Review conversion report
-cat CONVERSION_REPORT.md
 
 # 6. Commit and push
 git init && git add . && git commit -m "Convert to AtomGit"
@@ -89,13 +83,13 @@ GITHUB_TOKEN           → ATOMGIT_TOKEN
 GITHUB_WORKSPACE       → ATOMGIT_WORKSPACE
 GITHUB_RUN_ID          → ATOMGIT_RUN_ID
 GITHUB_SERVER_URL      → ATOMGIT_SERVER_URL
-... (50+ variables, see line 35 in convert.py)
+... (50+ variables, see convert.py)
 ```
 
 ### What Is NOT Converted
 
 - ❌ URLs like `github.com`, `raw.githubusercontent.com`
-- ❌ `@actions/github` imports (preserved as-is, manual adaptation required)
+- ❌ `@actions/*` dependency packages (must be manually replaced with AtomGit equivalents)
 - ❌ User-defined `GITHUB_*` variables
 
 ### Examples
@@ -104,8 +98,14 @@ GITHUB_SERVER_URL      → ATOMGIT_SERVER_URL
 |----------|-----------|
 | `${{ github.token }}` | `${{ atomgit.token }}` |
 | `process.env.GITHUB_SHA` | `process.env.ATOMGIT_SHA` |
-| `import * as core from '@actions/core'` | `import * as core from '@atomgit/core'` |
 | `echo $GITHUB_OUTPUT` | `echo $ATOMGIT_OUTPUT` |
+
+## ⚠️ Important Reminders
+
+- **Rebuild Required**: After converting source code, you MUST run `npm run build`,
+  otherwise the published plugin will still use the old dist/ bundle
+- **@actions/* Dependencies**: AtomGit does not provide `@atomgit/*` toolkit packages.
+  Users must handle these manually.
 
 ## Conversion Report
 
@@ -115,6 +115,7 @@ After conversion, `CONVERSION_REPORT.md` is generated with:
 - List of modified files
 - All replacement details
 - Build/test status
+- ⚠️ Rebuild reminder
 
 ## Project Structure
 
