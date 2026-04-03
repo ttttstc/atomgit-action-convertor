@@ -3,7 +3,7 @@
 GitHub Actions → CodeArts Actions (AtomGit) Source Repo Converter
 
 Converts a GitHub Actions source code repository into a complete AtomGit
-(CodeArts Actions) plugin repository by transforming:
+Actions plugin repository by transforming:
 - System environment variables: GITHUB_* → ATOMGIT_*
 - Process file variables: $GITHUB_* → $ATOMGIT_*
 - Context expressions: github.* → atomgit.* (inside ${{ }} blocks)
