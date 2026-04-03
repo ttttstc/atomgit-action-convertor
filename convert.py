@@ -2,19 +2,18 @@
 """
 GitHub Actions → CodeArts Actions (AtomGit) Source Repo Converter
 
-Converts a GitHub Actions source code repository into a complete AtomGit
-Actions plugin repository by transforming:
+Converts a GitHub Actions source code repository into a CodeArts Actions
+(AtomGit) plugin repository by transforming:
 - System environment variables: GITHUB_* → ATOMGIT_*
-- Process file variables: $GITHUB_* → $ATOMGIT_*
 - Context expressions: github.* → atomgit.* (inside ${{ }} blocks)
-- Toolkit dependencies: @actions/* → @atomgit/*
 
-The input is a full GitHub Actions source repo. The output is a structurally
-identical but fully converted AtomGit plugin repo, ready to push and publish.
+Note: This converter does NOT handle @actions/* package replacement.
+Users must maintain their own AtomGit-compatible toolkit packages.
 
 Usage:
     python convert.py --input <source-repo> --output <output-repo>
     python convert.py --input <source-repo> --output <output-repo> --dry-run
+    python convert.py --input <source-repo> --evaluate-only
 """
 
 import argparse
@@ -49,15 +48,12 @@ GITHUB_SYSTEM_VARS = {
     "GITHUB_WORKSPACE",
 }
 
-# Packages that get replaced
-REPLACEABLE_PACKAGES = {
+# Incompatible packages — flagged in report, NOT replaced
+# (AtomGit does not provide @atomgit/* toolkit packages)
+INCOMPATIBLE_PACKAGES = {
     "@actions/core", "@actions/exec", "@actions/io",
     "@actions/tool-cache", "@actions/http-client",
     "@actions/glob", "@actions/cache", "@actions/artifact",
-}
-
-# Packages that are NOT replaced (flag as incompatible)
-INCOMPATIBLE_PACKAGES = {
     "@actions/github",
 }
 
@@ -201,7 +197,7 @@ def validate_input(source_dir: Path) -> tuple:
 
 
 # ============================================================================
-# Step 1c: Non-blocking Compatibility Scan
+# Step 1b: Compatibility Scan
 # ============================================================================
 
 # RED patterns
@@ -238,7 +234,6 @@ def scan_file_for_issues(filepath: Path, rel_path: str) -> list:
 
         for pattern, category in YELLOW_PATTERNS:
             if pattern.search(line):
-                # Check if it's context-only usage (YELLOW) vs API usage (RED)
                 issues.append(Issue(
                     file=rel_path, line=line_num,
                     severity=Severity.YELLOW, category=category,
@@ -266,7 +261,7 @@ def scan_package_json(source_dir: Path) -> list:
         if pkg_name in deps:
             issues.append(Issue(
                 file="package.json", line=0,
-                severity=Severity.YELLOW,
+                severity=Severity.YELLOW if pkg_name == "@actions/github" else Severity.YELLOW,
                 category=f"Incompatible dependency: {pkg_name}",
                 snippet=f"{pkg_name}: {deps[pkg_name]}"
             ))
@@ -275,7 +270,7 @@ def scan_package_json(source_dir: Path) -> list:
 
 
 def scan_compatibility(source_dir: Path) -> list:
-    """Step 1c: Non-blocking compatibility scan. Results go into the report."""
+    """Step 1b: Compatibility scan. Results go into the report."""
     all_issues = []
 
     # Scan package.json
@@ -291,7 +286,6 @@ def scan_compatibility(source_dir: Path) -> list:
         for filepath in source_dir.glob(glob_pattern):
             if filepath in scanned:
                 continue
-            # Skip node_modules and dist
             rel = filepath.relative_to(source_dir)
             if any(part in ("node_modules", "dist", ".git") for part in rel.parts):
                 continue
@@ -300,16 +294,114 @@ def scan_compatibility(source_dir: Path) -> list:
                 scan_file_for_issues(filepath, str(rel))
             )
 
-    # Upgrade YELLOW @actions/github issues to RED if getOctokit is also found
-    has_get_octokit = any(
-        i.category == "getOctokit() call" for i in all_issues
-    )
-    if has_get_octokit:
-        for issue in all_issues:
-            if issue.category in ("@actions/github import", "@actions/github require"):
-                issue.severity = Severity.RED
-
     return all_issues
+
+
+def output_evaluation_report(plugin_name: str, runs: dict, issues: list):
+    """Output pre-conversion evaluation report."""
+    # Categorize issues
+    green_items = []
+    yellow_items = []
+    red_items = []
+
+    for issue in issues:
+        if issue.severity == Severity.RED:
+            red_items.append(issue)
+        elif issue.severity == Severity.YELLOW:
+            yellow_items.append(issue)
+        else:
+            green_items.append(issue)
+
+    lines = [
+        f"# 转换可行性评估报告: {plugin_name}",
+        "",
+        f"**兼容性等级**: {Severity.RED.value if red_items else Severity.YELLOW.value if yellow_items else Severity.GREEN.value}",
+        "",
+        "## 入口点",
+        "",
+        f"- **using**: `{runs['using']}`",
+        f"- **main**: `{runs['main']}`",
+        f"- **pre**: `{runs.get('pre') or '无'}`",
+        f"- **post**: `{runs.get('post') or '无'}`",
+        "",
+    ]
+
+    # GREEN items
+    lines.append("## ✅ 可自动转换 (GREEN)")
+    lines.append("")
+    lines.append("以下内容将自动转换，无需人工介入：")
+    lines.append("")
+    lines.append("| 类型 | 规则 |")
+    lines.append("|------|------|")
+    lines.append("| 环境变量 | `GITHUB_*` → `ATOMGIT_*` (50+ 变量) |")
+    lines.append("| 上下文表达式 | `${{ github.* }}` → `${{ atomgit.* }}` |")
+    lines.append("| Shell 变量 | `$GITHUB_OUTPUT` → `$ATOMGIT_OUTPUT` 等 |")
+    lines.append("")
+
+    # YELLOW items
+    if yellow_items:
+        lines.append("## ⚠️ 需手动适配 (YELLOW)")
+        lines.append("")
+        lines.append("以下依赖包**不会自动替换**，转换后需手动处理：")
+        lines.append("")
+        for issue in yellow_items:
+            if issue.file == "package.json":
+                lines.append(f"- `{issue.file}`: {issue.snippet}")
+            else:
+                lines.append(f"- `{issue.file}:{issue.line}` — {issue.category}")
+                lines.append(f"  ```")
+                lines.append(f"  {issue.snippet}")
+                lines.append(f"  ```")
+        lines.append("")
+        lines.append("**说明**: AtomGit 不提供 `@atomgit/*` 工具包，需用户：")
+        lines.append("1. 自行维护一套 `@atomgit/*` 包，或")
+        lines.append("2. 替换为 AtomGit 平台提供的等效方案")
+        lines.append("")
+
+    # RED items
+    if red_items:
+        lines.append("## ❌ 无法自动转换 (RED)")
+        lines.append("")
+        lines.append("以下问题需要人工审查和处理：")
+        lines.append("")
+        for issue in red_items:
+            lines.append(f"- `{issue.file}:{issue.line}` — {issue.category}")
+            lines.append(f"  ```")
+            lines.append(f"  {issue.snippet}")
+            lines.append(f"  ```")
+        lines.append("")
+        lines.append("**建议**: 这些模式涉及 GitHub API 调用或 Octokit，")
+        lines.append("需要根据 AtomGit API 重新实现相关逻辑。")
+        lines.append("")
+
+    # Recommendation
+    if red_items:
+        lines.append("## 📋 建议")
+        lines.append("")
+        lines.append("⏸️ **终止转换** — 请先处理 RED 项后再继续")
+    elif yellow_items:
+        lines.append("## 📋 建议")
+        lines.append("")
+        lines.append("✅ **可继续转换** — YELLOW 项需转换后手动适配")
+        lines.append("1. 执行转换: `python convert.py --input <repo> --output <output>`")
+        lines.append("2. 手动处理 YELLOW 项（@actions/* 依赖）")
+        lines.append("3. 重新构建: `npm run build`")
+        lines.append("4. 验证测试")
+    else:
+        lines.append("## 📋 建议")
+        lines.append("")
+        lines.append("✅ **可完全自动转换** — 无需人工介入")
+        lines.append("1. 执行转换: `python convert.py --input <repo> --output <output>`")
+        lines.append("2. 构建: `npm run build`")
+        lines.append("3. 验证测试")
+
+    report_content = "\n".join(lines)
+    print(report_content)
+
+    # Also write to file
+    report_path = Path(f"EVALUATION_REPORT.md")
+    report_path.write_text(report_content, encoding="utf-8")
+    print(f"\n📝 评估报告已保存到: {report_path}")
 
 
 # ============================================================================
@@ -318,11 +410,9 @@ def scan_compatibility(source_dir: Path) -> list:
 
 def is_inside_url(text: str, match_start: int) -> bool:
     """Check if a match position is inside a URL pattern."""
-    # Look back up to 30 chars for URL indicators
     lookback = text[max(0, match_start - 30):match_start]
     if "://" in lookback or lookback.rstrip().endswith("."):
         return True
-    # Check if followed by .com, .io, etc.
     lookahead = text[match_start:match_start + 20]
     if re.match(r'github\.(com|io|dev)\b', lookahead):
         return True
@@ -330,20 +420,13 @@ def is_inside_url(text: str, match_start: int) -> bool:
 
 
 def transform_expression(expr: str) -> str:
-    """Transform github.* references inside a ${{ }} expression.
-
-    Splits on string literals to protect them, then replaces github. → atomgit.
-    in non-literal segments only.
-    """
-    # Split on single-quoted string literals
+    """Transform github.* references inside a ${{ }} expression."""
     parts = re.split(r"('(?:[^'\\]|\\.)*')", expr)
     result = []
     for i, part in enumerate(parts):
         if i % 2 == 1:
-            # Inside string literal — don't touch
             result.append(part)
         else:
-            # Outside string literal — replace github. identifiers
             part = re.sub(r'\bgithub\.', 'atomgit.', part)
             result.append(part)
     return ''.join(result)
@@ -375,18 +458,10 @@ def transform_action_yml(content: str) -> tuple:
         # 2. Transform GITHUB_* env var references (whitelist only)
         for var in GITHUB_SYSTEM_VARS:
             atomgit_var = var.replace("GITHUB_", "ATOMGIT_", 1)
-            # Match as complete variable name (not part of a longer name)
             pattern = re.compile(rf'\b{re.escape(var)}\b')
             if pattern.search(line):
-                # Guard against URL context
-                for m in pattern.finditer(line):
-                    if not is_inside_url(line, m.start()):
-                        line = line[:m.start()] + atomgit_var + line[m.end():]
-                        break  # Re-scan after modification (positions shifted)
-                # Simple approach: just replace all non-URL occurrences
-                # More robust: re-run until stable
                 new_line = line
-                for _ in range(5):  # Max 5 replacements per line
+                for _ in range(5):
                     prev = new_line
                     for m in pattern.finditer(new_line):
                         if not is_inside_url(new_line, m.start()):
@@ -409,56 +484,11 @@ def transform_action_yml(content: str) -> tuple:
 
 
 # ============================================================================
-# Step 3: package.json Transformation
-# ============================================================================
-
-def transform_package_json(content: str) -> tuple:
-    """Step 3: Transform package.json content.
-
-    Returns: (transformed_content, list_of_replacements)
-    """
-    replacements = []
-
-    try:
-        pkg = json.loads(content)
-    except json.JSONDecodeError as e:
-        return content, [Replacement(
-            file="package.json", line=0,
-            category="parse_error",
-            before=f"JSON parse error: {e}", after=""
-        )]
-
-    # Replace in dependencies and devDependencies
-    for dep_key in ("dependencies", "devDependencies"):
-        if dep_key not in pkg:
-            continue
-
-        new_deps = {}
-        for name, version in pkg[dep_key].items():
-            if name in REPLACEABLE_PACKAGES:
-                new_name = name.replace("@actions/", "@atomgit/", 1)
-                new_deps[new_name] = version
-                replacements.append(Replacement(
-                    file="package.json", line=0,
-                    category=f"{dep_key} replacement",
-                    before=f"{name}: {version}",
-                    after=f"{new_name}: {version}"
-                ))
-            else:
-                new_deps[name] = version
-
-        pkg[dep_key] = new_deps
-
-    transformed = json.dumps(pkg, indent=2, ensure_ascii=False) + "\n"
-    return transformed, replacements
-
-
-# ============================================================================
-# Step 4: Source Code Transformation
+# Step 3: Source Code Transformation
 # ============================================================================
 
 def transform_source_file(content: str, filepath: str) -> tuple:
-    """Step 4: Transform a JS/TS source file.
+    """Step 3: Transform a JS/TS source file.
 
     Returns: (transformed_content, list_of_replacements)
     """
@@ -475,25 +505,13 @@ def transform_source_file(content: str, filepath: str) -> tuple:
             result_lines.append(line)
             continue
 
-        # Rule 4a: Import/require path replacement
-        # require('@actions/core') → require('@atomgit/core')
-        for pkg in REPLACEABLE_PACKAGES:
-            atomgit_pkg = pkg.replace("@actions/", "@atomgit/", 1)
-            # Handle both single and double quotes
-            for q in ("'", '"'):
-                old = f"{q}{pkg}{q}"
-                new = f"{q}{atomgit_pkg}{q}"
-                if old in line:
-                    line = line.replace(old, new)
-
-        # Rule 4b: process.env.GITHUB_* direct access (whitelist only)
+        # Rule 3a: process.env.GITHUB_* direct access (whitelist only)
         for var in GITHUB_SYSTEM_VARS:
             atomgit_var = var.replace("GITHUB_", "ATOMGIT_", 1)
 
             # process.env.GITHUB_XXX
             pattern_dot = f"process.env.{var}"
             if pattern_dot in line:
-                # Guard: make sure it's not inside a URL
                 idx = line.find(pattern_dot)
                 if idx >= 0 and not is_inside_url(line, idx):
                     line = line.replace(pattern_dot, f"process.env.{atomgit_var}")
@@ -505,8 +523,7 @@ def transform_source_file(content: str, filepath: str) -> tuple:
                 if bracket_old in line:
                     line = line.replace(bracket_old, bracket_new)
 
-        # Rule 4c: Destructuring from process.env
-        # const { GITHUB_TOKEN, GITHUB_SHA } = process.env
+        # Rule 3b: Destructuring from process.env
         destructure_match = re.search(
             r'(?:const|let|var)\s*\{([^}]+)\}\s*=\s*process\.env', line
         )
@@ -521,12 +538,9 @@ def transform_source_file(content: str, filepath: str) -> tuple:
             if new_vars_block != vars_block:
                 line = line.replace(vars_block, new_vars_block)
 
-        # Rule 4d: Shell variable references in template strings
-        # `echo $GITHUB_SHA` → `echo $ATOMGIT_SHA`
-        # Only match $GITHUB_XXX that are in the whitelist
+        # Rule 3c: Shell variable references in template strings
         for var in GITHUB_SYSTEM_VARS:
             atomgit_var = var.replace("GITHUB_", "ATOMGIT_", 1)
-            # Match $GITHUB_XXX or ${GITHUB_XXX} in strings
             shell_patterns = [
                 (rf'\${re.escape(var)}\b', f'${atomgit_var}'),
                 (rf'\$\{{{re.escape(var)}\}}', f'${{{atomgit_var}}}'),
@@ -534,7 +548,6 @@ def transform_source_file(content: str, filepath: str) -> tuple:
             for pat, repl in shell_patterns:
                 new_line = re.sub(pat, repl, line)
                 if new_line != line:
-                    # Verify not inside a URL
                     line = new_line
 
         # Record replacement
@@ -552,11 +565,11 @@ def transform_source_file(content: str, filepath: str) -> tuple:
 
 
 # ============================================================================
-# Step 6: Verification — Dependency Leak Check
+# Step 4: Verification — Leak Check
 # ============================================================================
 
 def check_leaks_in_dist(output_dir: Path) -> list:
-    """Scan dist/ for any remaining GITHUB_ or @actions/ references."""
+    """Scan dist/ for any remaining GITHUB_ references."""
     leaks = []
     dist_dir = output_dir / "dist"
     if not dist_dir.exists():
@@ -571,20 +584,9 @@ def check_leaks_in_dist(output_dir: Path) -> list:
         rel = filepath.relative_to(output_dir)
 
         for line_num, line in enumerate(content.splitlines(), 1):
-            # Check for @actions/ (excluding @actions/github which is allowed)
-            for pkg in REPLACEABLE_PACKAGES:
-                if pkg in line:
-                    leaks.append(Issue(
-                        file=str(rel), line=line_num,
-                        severity=Severity.YELLOW,
-                        category=f"Leak: {pkg} in dist",
-                        snippet=line.strip()[:120]
-                    ))
-
             # Check for GITHUB_ system vars
             for var in GITHUB_SYSTEM_VARS:
                 if var in line and not is_inside_url(line, line.find(var)):
-                    # Exclude common false positives in comments
                     leaks.append(Issue(
                         file=str(rel), line=line_num,
                         severity=Severity.YELLOW,
@@ -602,17 +604,17 @@ def check_leaks_in_dist(output_dir: Path) -> list:
 def generate_report(report: ConversionReport) -> str:
     """Generate a Markdown conversion report."""
     lines = [
-        f"# Conversion Report: {report.plugin_name}",
+        f"# 转换报告: {report.plugin_name}",
         "",
-        f"**Compatibility Rating**: {report.compatibility.value}",
-        f"**Build Status**: {report.build_status}",
-        f"**Test Status**: {report.test_status}",
+        f"**兼容性等级**: {report.compatibility.value}",
+        f"**构建状态**: {report.build_status}",
+        f"**测试状态**: {report.test_status}",
         "",
     ]
 
     # Entry points
     if report.entry_points:
-        lines.append("## Entry Points")
+        lines.append("## 入口点")
         lines.append("")
         for key, val in report.entry_points.items():
             if val:
@@ -621,10 +623,10 @@ def generate_report(report: ConversionReport) -> str:
 
     # Issues
     if report.issues:
-        lines.append("## Compatibility Issues")
+        lines.append("## 兼容性问题")
         lines.append("")
         for issue in report.issues:
-            icon = {"RED": "🔴", "YELLOW": "🟡", "GREEN": "🟢"}[issue.severity.value]
+            icon = {"RED": "❌", "YELLOW": "⚠️", "GREEN": "✅"}[issue.severity.value]
             lines.append(
                 f"- {icon} **{issue.severity.value}** `{issue.file}:{issue.line}` "
                 f"— {issue.category}"
@@ -636,18 +638,18 @@ def generate_report(report: ConversionReport) -> str:
 
     # Files modified
     if report.files_modified:
-        lines.append("## Files Modified")
+        lines.append("## 修改的文件")
         lines.append("")
         total = sum(report.files_modified.values())
-        lines.append(f"**Total replacements**: {total}")
+        lines.append(f"**总替换数**: {total}")
         lines.append("")
         for filepath, count in sorted(report.files_modified.items()):
-            lines.append(f"- `{filepath}`: {count} change(s)")
+            lines.append(f"- `{filepath}`: {count} 处变更")
         lines.append("")
 
     # Replacement details
     if report.replacements:
-        lines.append("## Replacement Details")
+        lines.append("## 替换详情")
         lines.append("")
         for repl in report.replacements:
             lines.append(f"### `{repl.file}:{repl.line}` ({repl.category})")
@@ -657,6 +659,13 @@ def generate_report(report: ConversionReport) -> str:
             lines.append(f"```")
             lines.append("")
 
+    # Rebuild reminder
+    lines.append("## ⚠️ 重要提醒")
+    lines.append("")
+    lines.append("- [ ] 源码已转换 → **必须重新构建** (`npm run build`)")
+    lines.append("- [ ] 不重建 = 发布的还是旧的 dist/ 产物")
+    lines.append("- [ ] @actions/* 依赖需手动替换为 AtomGit 对应方案")
+
     return "\n".join(lines)
 
 
@@ -665,24 +674,19 @@ def generate_report(report: ConversionReport) -> str:
 # ============================================================================
 
 def convert(source_dir: Path, output_dir: Path, dry_run: bool = False) -> ConversionReport:
-    """Execute the full conversion pipeline.
-
-    Converts a GitHub Actions source code repository into a complete
-    AtomGit (CodeArts Actions) plugin repository.
-    """
+    """Execute the full conversion pipeline."""
 
     plugin_name = source_dir.name
     report = ConversionReport(plugin_name=plugin_name)
 
-    print(f"🔄 Converting GitHub Actions repo → AtomGit plugin repo")
-    print(f"   Source repo: {source_dir}")
-    print(f"   Output repo: {output_dir}")
+    print(f"🔄 转换 GitHub Actions → AtomGit 插件仓库")
+    print(f"   源仓库: {source_dir}")
+    print(f"   输出: {output_dir}")
     print()
 
     # Step 1: Repository Analysis & Initialization
-    print("Step 1: Repository Analysis & Initialization...")
+    print("Step 1: 仓库分析与初始化...")
 
-    # 1a. Validate input structure
     action_path, runs, errors = validate_input(source_dir)
     if errors:
         for err in errors:
@@ -699,35 +703,34 @@ def convert(source_dir: Path, output_dir: Path, dry_run: bool = False) -> Conver
         "pre": runs.get("pre"),
         "post": runs.get("post"),
     }
-    print(f"  ✅ Plugin type: {runs['using']}, main={runs['main']}, "
-          f"pre={runs.get('pre', 'none')}, post={runs.get('post', 'none')}")
+    print(f"  ✅ 插件类型: {runs['using']}, main={runs['main']}, "
+          f"pre={runs.get('pre', '无')}, post={runs.get('post', '无')}")
 
-    # 1b. Initialize output repo (copy source, excluding node_modules/.git/dist)
+    # Initialize output repo
     if not dry_run:
         if output_dir.exists():
             shutil.rmtree(output_dir)
         shutil.copytree(source_dir, output_dir, ignore=shutil.ignore_patterns(
             'node_modules', '.git', 'dist'
         ))
-        print(f"  📁 Initialized output repo: {output_dir}")
+        print(f"  📁 已初始化输出仓库: {output_dir}")
 
-    # 1c. Non-blocking compatibility scan
-    print("  🔍 Scanning for non-convertible patterns...")
+    # Compatibility scan
+    print("  🔍 扫描兼容性问题...")
     issues = scan_compatibility(source_dir)
     for issue in issues:
         report.add_issue(issue)
-        icon = {"RED": "🔴", "YELLOW": "🟡"}[issue.severity.value]
+        icon = {"RED": "❌", "YELLOW": "⚠️", "GREEN": "✅"}[issue.severity.value]
         print(f"     {icon} [{issue.severity.value}] {issue.file}:{issue.line} "
               f"— {issue.category}")
 
     if not issues:
-        print("  ✅ No compatibility issues detected (GREEN)")
+        print("  ✅ 无兼容性问题 (GREEN)")
     else:
-        print(f"  ⚠️  {len(issues)} issue(s) detected — recorded in CONVERSION_REPORT.md, "
-              f"proceeding with conversion")
+        print(f"  ⚠️  发现 {len(issues)} 个问题 — 记录在 CONVERSION_REPORT.md")
 
     # Step 2: action.yml Transformation
-    print("\nStep 2: action.yml Transformation...")
+    print("\nStep 2: action.yml 转换...")
     action_name = action_path.name
     action_file = output_dir / action_name if not dry_run else action_path
     content = action_file.read_text(encoding="utf-8")
@@ -736,29 +739,10 @@ def convert(source_dir: Path, output_dir: Path, dry_run: bool = False) -> Conver
         report.add_replacement(r)
     if not dry_run and repls:
         action_file.write_text(transformed, encoding="utf-8")
-    print(f"  ✅ {len(repls)} replacement(s) in {action_name}")
+    print(f"  ✅ {len(repls)} 处替换")
 
-    # Step 3: package.json Transformation
-    print("\nStep 3: package.json Transformation...")
-    pkg_file = output_dir / "package.json" if not dry_run else source_dir / "package.json"
-    content = pkg_file.read_text(encoding="utf-8")
-    transformed, repls = transform_package_json(content)
-    for r in repls:
-        report.add_replacement(r)
-    if not dry_run and repls:
-        pkg_file.write_text(transformed, encoding="utf-8")
-    print(f"  ✅ {len(repls)} dependency replacement(s)")
-
-    # Delete lock files
-    if not dry_run:
-        for lock_file in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml"):
-            lock_path = output_dir / lock_file
-            if lock_path.exists():
-                lock_path.unlink()
-                print(f"  🗑️  Deleted {lock_file}")
-
-    # Step 4: Source Code Transformation
-    print("\nStep 4: Source Code Transformation...")
+    # Step 3: Source Code Transformation
+    print("\nStep 3: 源码转换...")
     source_extensions = {".ts", ".js"}
     scan_dirs = ["src", "lib", "."]
     scanned = set()
@@ -786,37 +770,33 @@ def convert(source_dir: Path, output_dir: Path, dry_run: bool = False) -> Conver
                 if not dry_run and repls:
                     filepath.write_text(transformed, encoding="utf-8")
 
-    print(f"  ✅ {total_source_repls} replacement(s) across "
-          f"{len(scanned)} source file(s)")
+    print(f"  ✅ {total_source_repls} 处替换，扫描 {len(scanned)} 个源文件")
 
     if dry_run:
-        print("\n🏁 Dry-run complete. No files were modified.")
+        print("\n🏁 Dry-run 完成，未修改任何文件。")
         return report
 
     report.build_status = "pending"
     report.test_status = "pending"
 
-    # Generate conversion report file
+    # Generate conversion report
     report_content = generate_report(report)
     report_path = output_dir / "CONVERSION_REPORT.md"
     report_path.write_text(report_content, encoding="utf-8")
-    print(f"\n📝 Conversion report written to {report_path}")
+    print(f"\n📝 转换报告已写入: {report_path}")
 
     print("\n" + "=" * 60)
-    print(f"✅ Repo conversion complete: {plugin_name}")
-    print(f"   Output repo: {output_dir}")
-    print(f"   Compatibility: {report.compatibility.value}")
-    print(f"   Total replacements: {len(report.replacements)}")
-    print(f"   Files modified: {len(report.files_modified)}")
+    print(f"✅ 转换完成: {plugin_name}")
+    print(f"   输出仓库: {output_dir}")
+    print(f"   兼容性: {report.compatibility.value}")
+    print(f"   总替换数: {len(report.replacements)}")
     print("=" * 60)
     print()
-    print("Next steps:")
-    print(f"  1. cd {output_dir}")
-    print(f"  2. npm install")
-    print(f"  3. npm run build  (or: npx @vercel/ncc build {runs['main']} -o dist)")
-    print(f"  4. npm test  (if tests exist)")
-    print(f"  5. Review CONVERSION_REPORT.md for any flagged issues")
-    print(f"  6. git init && git add . && git commit  (push as new AtomGit repo)")
+    print("⚠️  重要提醒:")
+    print("   1. @actions/* 依赖需手动替换为 AtomGit 对应方案")
+    print("   2. 必须重新构建: npm run build")
+    print("   3. 验证测试")
+    print("   4. 审查 CONVERSION_REPORT.md 中的 YELLOW/RED 项")
 
     return report
 
@@ -828,7 +808,8 @@ def convert(source_dir: Path, output_dir: Path, dry_run: bool = False) -> Conver
 def main():
     parser = argparse.ArgumentParser(
         description="Convert a GitHub Actions source repo into a CodeArts Actions "
-                    "(AtomGit) plugin repo"
+                    "(AtomGit) plugin repo. NOTE: @actions/* packages are NOT "
+                    "replaced — users must provide their own AtomGit toolkit."
     )
     parser.add_argument(
         "--input", "-i", required=True,
@@ -843,6 +824,10 @@ def main():
         "--dry-run", action="store_true",
         help="Analyze and report without modifying any files"
     )
+    parser.add_argument(
+        "--evaluate-only", "-e", action="store_true",
+        help="Only perform pre-conversion compatibility evaluation, then exit"
+    )
 
     args = parser.parse_args()
 
@@ -851,6 +836,18 @@ def main():
         print(f"❌ Source directory not found: {source_dir}")
         sys.exit(1)
 
+    # Evaluation-only mode
+    if args.evaluate_only:
+        print("🔍 Running pre-conversion compatibility evaluation...\n")
+        _, runs, errors = validate_input(source_dir)
+        if errors:
+            for err in errors:
+                print(f"  ❌ {err}")
+            sys.exit(1)
+        issues = scan_compatibility(source_dir)
+        output_evaluation_report(source_dir.name, runs, issues)
+        sys.exit(0)
+
     if args.output:
         output_dir = Path(args.output).resolve()
     else:
@@ -858,7 +855,7 @@ def main():
 
     report = convert(source_dir, output_dir, dry_run=args.dry_run)
 
-    # Exit code: 0=GREEN, 1=YELLOW, 2=RED (non-blocking, just informational)
+    # Exit code: 0=GREEN, 1=YELLOW, 2=RED
     if report.compatibility == Severity.RED:
         sys.exit(2)
     elif report.compatibility == Severity.YELLOW:
